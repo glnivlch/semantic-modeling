@@ -1,13 +1,16 @@
 """Минимальное ядро в памяти по договору данных версии 0.3.
 
-SQLite будет добавлена на следующем этапе.
+SQLite хранит факты, NetworkX представляет проверенные данные в памяти.
 """
 
 from copy import deepcopy
 from datetime import datetime, timezone
 from math import isfinite
+import sqlite3
 
 import networkx as nx
+
+import sqlite_storage as storage
 
 
 NODE_TYPES = {"Equipment", "Component", "Sensor", "Measurement", "Event"}
@@ -24,17 +27,45 @@ COMPUTED_RELATIONS = {"BEFORE", "AFTER", "AFTER_NOT_CAUSED_BY"}
 DEFERRED_EDGE_FIELDS = {"time_scope", "valid_from", "valid_to", "base_weight", "decay_policy"}
 
 
+class GraphInitializationError(Exception):
+    """Ошибка запуска: код договора и пояснение для пользователя."""
+
+    def __init__(self, error_code, message):
+        self.error_code = error_code
+        self.message = message
+        super().__init__(message)
+
+
 class GraphCore:
     """Управляет вершинами и связями, сохраняя внутренний граф закрытым."""
 
-    def __init__(self):
+    def __init__(self, db_path=":memory:"):
         self._graph = nx.MultiDiGraph()
         # Ключ ребра в NetworkX уникален только внутри пары вершин.
         # Этот индекс обеспечивает уникальность ID во всём графе.
         self._edge_locations = {}
+        self._connection = None
+        self._closed = False
+        self._blocked = False
+        try:
+            self._connection = storage.open_database(db_path)
+            self._restore()
+        except (sqlite3.Error, OSError) as exc:
+            self.close()
+            raise GraphInitializationError("storage_error", str(exc)) from exc
+        except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+            self.close()
+            raise GraphInitializationError("invalid_data", str(exc)) from exc
 
     def create_node(self, node: dict) -> dict:
         """Проверить запись и добавить её либо вернуть результат повтора."""
+        error = self._availability_error()
+        if error:
+            return error
+        return self._create_node(node, persist=True)
+
+    def _create_node(self, node, persist=False):
+        """Общие проверки для создания и загрузки; загрузка не пишет в SQLite."""
         if not isinstance(node, dict):
             return self._error("invalid_data", "Вершина должна быть словарём.")
 
@@ -65,12 +96,28 @@ class GraphCore:
                 return self._error("conflict", "ID уже занят другими данными.")
             return self._result([existing], effect="already_exists")
 
-        self._graph.add_node(node_id)
-        self._graph.nodes[node_id].update(record)
+        if persist:
+            try:
+                storage.write_node(self._connection, record)
+            except sqlite3.Error as exc:
+                return self._storage_error(exc)
+            except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+                return self._error("invalid_data", str(exc))
+        try:
+            self._add_node_to_graph(record)
+        except Exception as exc:
+            if not persist:
+                raise
+            error = self._recover_after_write(exc)
+            if error:
+                return error
         return self._result([record], effect="created")
 
     def find_nodes(self, **filters) -> dict:
         """Найти вершины: фильтры id, type и text объединяются через «и»."""
+        error = self._availability_error()
+        if error:
+            return error
         if filters.keys() - {"id", "type", "text"}:
             return self._error("invalid_data", "Передан неподдерживаемый фильтр.")
         if any(not isinstance(value, str) for value in filters.values()):
@@ -95,6 +142,12 @@ class GraphCore:
 
     def create_edge(self, edge: dict) -> dict:
         """Создать сохраняемую связь, используя её ID как ключ ребра."""
+        error = self._availability_error()
+        if error:
+            return error
+        return self._create_edge(edge, persist=True)
+
+    def _create_edge(self, edge, persist=False):
         if not isinstance(edge, dict):
             return self._error("invalid_data", "Связь должна быть словарём.")
         try:
@@ -151,13 +204,28 @@ class GraphCore:
                 if existing["relation"] == relation and object_id != target:
                     return self._error("conflict", "Измерение уже связано с другим объектом.")
 
-        self._graph.add_edge(source, target, key=edge_id)
-        self._graph.edges[source, target, edge_id].update(record)
-        self._edge_locations[edge_id] = (source, target)
+        if persist:
+            try:
+                storage.write_edge(self._connection, record)
+            except sqlite3.Error as exc:
+                return self._storage_error(exc)
+            except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+                return self._error("invalid_data", str(exc))
+        try:
+            self._add_edge_to_graph(record)
+        except Exception as exc:
+            if not persist:
+                raise
+            error = self._recover_after_write(exc)
+            if error:
+                return error
         return self._result([], [record], effect="created")
 
     def neighbors(self, subject_id, relation=None, direction="outgoing", **filters) -> dict:
         """Вернуть соседей одного шага и все подходящие параллельные связи."""
+        error = self._availability_error()
+        if error:
+            return error
         deferred_filters = {"valid_at", "event_time_from", "event_time_to",
                             "window_from", "window_to", "evaluation_time"}
         if filters.keys() - deferred_filters:
@@ -196,6 +264,90 @@ class GraphCore:
         if result["status"] == "no_data":
             result["message"] = "Соседние вершины не найдены."
         return result
+
+    def _add_node_to_graph(self, record):
+        self._graph.add_node(record["id"])
+        self._graph.nodes[record["id"]].update(record)
+
+    def _add_edge_to_graph(self, record):
+        source, target, edge_id = record["source"], record["target"], record["id"]
+        self._graph.add_edge(source, target, key=edge_id)
+        self._graph.edges[source, target, edge_id].update(record)
+        self._edge_locations[edge_id] = (source, target)
+
+    @classmethod
+    def _build_graph(cls, nodes, edges):
+        # Временный проверяющий объект без соединения и без публичных операций.
+        candidate = cls.__new__(cls)
+        candidate._graph = nx.MultiDiGraph()
+        candidate._edge_locations = {}
+        for records, add in ((nodes, candidate._create_node), (edges, candidate._create_edge)):
+            for record in records:
+                result = add(record, persist=False)
+                if result.get("effect") != "created":
+                    raise ValueError(result.get("message", "Повторяющиеся ID в снимке графа."))
+        return candidate._graph, candidate._edge_locations
+
+    def _restore(self):
+        nodes, edges = storage.read_graph(self._connection)
+        graph, locations = self._build_graph(nodes, edges)
+        self._graph, self._edge_locations = graph, locations
+
+    def _availability_error(self):
+        if self._closed or self._blocked:
+            return self._error("storage_error", "Ядро закрыто или заблокировано после ошибки хранения.")
+        return None
+
+    def _storage_error(self, exc):
+        try:
+            if self._connection.in_transaction:
+                self._blocked = True
+        except sqlite3.Error:
+            self._blocked = True
+        return self._error("storage_error", str(exc))
+
+    def _recover_after_write(self, exc):
+        """SQLite уже сохранила факт: перечитать его или запретить дальнейшую работу."""
+        try:
+            self._restore()
+        except Exception:
+            self._blocked = True
+            return self._error("storage_error", f"Запись сохранена, но граф не восстановлен: {exc}")
+        return None
+
+    def save_graph(self) -> dict:
+        """Проверить и атомарно сохранить снимок без удаления постоянных фактов."""
+        error = self._availability_error()
+        if error:
+            return error
+        try:
+            nodes = []
+            for node_id, record in self._graph.nodes(data=True):
+                if node_id != record.get("id"):
+                    raise ValueError("Ключ вершины не совпадает с её ID.")
+                nodes.append(deepcopy(record))
+            edges = []
+            for source, target, edge_id, record in self._graph.edges(keys=True, data=True):
+                if (source, target, edge_id) != (record.get("source"), record.get("target"), record.get("id")):
+                    raise ValueError("Ключи связи не совпадают с её атрибутами.")
+                edges.append(deepcopy(record))
+            _, locations = self._build_graph(nodes, edges)
+            if locations != self._edge_locations:
+                raise ValueError("Индекс связей не соответствует графу.")
+            storage.save_snapshot(self._connection, nodes, edges)
+        except sqlite3.Error as exc:
+            return self._storage_error(exc)
+        except (ValueError, TypeError, RecursionError, OverflowError) as exc:
+            return self._error("invalid_data", str(exc))
+        return {"status": "ok", "nodes": [], "edges": [], "effect": "saved",
+                "saved_node_count": len(nodes), "saved_edge_count": len(edges)}
+
+    def close(self):
+        """Закрыть соединение; повторный вызов ничего не меняет."""
+        if not self._closed:
+            if self._connection is not None:
+                self._connection.close()
+            self._closed = True
 
     @staticmethod
     def _is_json_compatible(value) -> bool:
