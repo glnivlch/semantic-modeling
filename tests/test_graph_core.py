@@ -246,3 +246,315 @@ def test_accept_nested_json_values(core, equipment):
     assert core.create_node(equipment)["effect"] == "already_exists"
     assert core.find_nodes(id=equipment["id"])["nodes"] == [original]
     assert equipment == original
+
+
+@pytest.fixture
+def demo(core, equipment):
+    """Небольшой граф Н-101 без заранее созданных связей."""
+    nodes = [
+        equipment,
+        {"id": "component:m101", "type": "Component", "label": "Двигатель М-101"},
+        {"id": "sensor:t101", "type": "Sensor", "label": "Датчик Т-101",
+         "properties": {"quantity": "temperature"}},
+        {"id": "measurement:t001", "type": "Measurement", "label": "Температура 95 °C",
+         "properties": {"quantity": "temperature", "value": 95, "unit": "°C",
+                        "observed_at": "2026-11-10T10:00:00+05:00"}},
+        {"id": "event:stop-001", "type": "Event", "label": "Остановка Н-101",
+         "properties": {"event_kind": "shutdown",
+                        "occurred_at": "2026-11-10T10:02:00+05:00"}},
+    ]
+    for node in nodes:
+        assert core.create_node(node)["effect"] == "created"
+    return core
+
+
+@pytest.fixture
+def edge():
+    return {"id": "edge:002", "source": "sensor:t101",
+            "target": "component:m101", "relation": "INSTALLED_ON"}
+
+
+def test_create_edge(demo, edge):
+    assert demo.create_edge(edge) == {
+        "status": "ok", "nodes": [], "edges": [edge], "effect": "created"
+    }
+
+
+@pytest.mark.parametrize("field", ["id", "source", "target", "relation"])
+@pytest.mark.parametrize("value", [None, "", [], 123])
+def test_edge_requires_nonempty_string_fields(demo, edge, field, value):
+    edge[field] = value
+    result = demo.create_edge(edge)
+    assert result["error_code"] == "invalid_data"
+    assert demo.neighbors("sensor:t101")["status"] == "no_data"
+
+
+@pytest.mark.parametrize("field", ["id", "source", "target", "relation"])
+def test_edge_missing_field(demo, edge, field):
+    del edge[field]
+    assert demo.create_edge(edge)["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("field", ["source", "target"])
+def test_edge_missing_endpoint(demo, edge, field):
+    edge[field] = "missing"
+    assert demo.create_edge(edge)["error_code"] == "not_found"
+    assert demo.find_nodes(id="missing")["status"] == "no_data"
+
+
+@pytest.mark.parametrize("relation", ["UNKNOWN", "BEFORE", "AFTER"])
+def test_reject_non_stored_relations(demo, edge, relation):
+    edge["relation"] = relation
+    assert demo.create_edge(edge)["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("relation", ["CAUSES", "NOT_CAUSES"])
+def test_deferred_relations_are_explicit(demo, edge, relation):
+    edge["relation"] = relation
+    assert demo.create_edge(edge)["error_code"] == "unsupported_operation"
+
+
+@pytest.mark.parametrize("field", ["time_scope", "valid_from", "valid_to", "base_weight", "decay_policy"])
+def test_deferred_edge_fields_are_not_ignored(demo, edge, field):
+    edge[field] = "not-supported-yet"
+    assert demo.create_edge(edge)["error_code"] == "unsupported_operation"
+
+
+def test_edge_rejects_invalid_type_pair(demo, edge):
+    edge["relation"] = "HAS_COMPONENT"
+    assert demo.create_edge(edge)["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("relation, source, target", [
+    ("HAS_COMPONENT", "equipment:n101", "component:m101"),
+    ("INSTALLED_ON", "sensor:t101", "equipment:n101"),
+    ("INSTALLED_ON", "sensor:t101", "component:m101"),
+    ("MONITORS", "sensor:t101", "equipment:n101"),
+    ("MONITORS", "sensor:t101", "component:m101"),
+    ("PRODUCED_MEASUREMENT", "sensor:t101", "measurement:t001"),
+    ("MEASURES", "measurement:t001", "equipment:n101"),
+    ("MEASURES", "measurement:t001", "component:m101"),
+    ("HAS_EVENT", "equipment:n101", "event:stop-001"),
+    ("HAS_EVENT", "component:m101", "event:stop-001"),
+])
+def test_all_allowed_edge_type_pairs(demo, relation, source, target):
+    result = demo.create_edge({"id": "edge:test", "source": source,
+                               "target": target, "relation": relation})
+    assert result["effect"] == "created"
+
+
+def test_repeated_edge(demo, edge):
+    demo.create_edge(edge)
+    assert demo.create_edge(edge)["effect"] == "already_exists"
+    assert len(demo.neighbors(edge["source"])["edges"]) == 1
+
+
+@pytest.mark.parametrize("changes", [
+    {"relation": "MONITORS"}, {"target": "equipment:n101"},
+    {"source": "measurement:t001", "target": "equipment:n101", "relation": "MEASURES"},
+    {"properties": {"note": "changed"}},
+])
+def test_edge_id_conflict_is_global(demo, edge, changes):
+    demo.create_edge(edge)
+    assert demo.create_edge({**edge, **changes})["error_code"] == "conflict"
+    assert demo.neighbors(edge["source"])["edges"] == [edge]
+
+
+def test_edge_and_node_ids_cannot_collide(demo, edge):
+    assert demo.create_edge({**edge, "id": "equipment:n101"})["error_code"] == "conflict"
+    demo.create_edge(edge)
+    result = demo.create_node({"id": edge["id"], "type": "Equipment", "label": "Насос"})
+    assert result["error_code"] == "conflict"
+
+
+def test_parallel_relations_and_facts_are_preserved(demo, edge):
+    edges = [edge, {**edge, "id": "edge:003", "relation": "MONITORS"},
+             {**edge, "id": "edge:001"}]
+    for item in edges:
+        assert demo.create_edge(item)["effect"] == "created"
+    result = demo.neighbors(edge["source"])
+    assert [n["id"] for n in result["nodes"]] == ["component:m101"]
+    assert result["edges"] == sorted(edges, key=lambda item: item["id"])
+
+
+@pytest.mark.parametrize("direction, subject", [
+    ("outgoing", "sensor:t101"), ("incoming", "component:m101"),
+])
+def test_neighbors_direction(demo, edge, direction, subject):
+    demo.create_edge(edge)
+    result = demo.neighbors(subject, direction=direction)
+    expected_neighbor = edge["target"] if direction == "outgoing" else edge["source"]
+    assert [n["id"] for n in result["nodes"]] == [expected_neighbor]
+    assert result["edges"] == [edge]
+
+
+def test_neighbors_both_directions_and_sorting(demo, edge):
+    demo.create_edge(edge)
+    outgoing = {"id": "edge:001", "source": "component:m101",
+                "target": "event:stop-001", "relation": "HAS_EVENT"}
+    demo.create_edge(outgoing)
+    result = demo.neighbors("component:m101", direction="both")
+    assert [n["id"] for n in result["nodes"]] == ["event:stop-001", "sensor:t101"]
+    assert result["edges"] == [outgoing, edge]
+
+
+def test_neighbors_relation_filter(demo, edge):
+    demo.create_edge(edge)
+    demo.create_edge({**edge, "id": "edge:003", "relation": "MONITORS"})
+    assert demo.neighbors(edge["source"], relation="INSTALLED_ON")["edges"] == [edge]
+    assert demo.neighbors(edge["source"], relation="HAS_EVENT")["status"] == "no_data"
+
+
+def test_neighbors_missing_node_and_empty_result(demo):
+    assert demo.neighbors("missing")["error_code"] == "not_found"
+    assert demo.neighbors("equipment:n101") == {
+        "status": "no_data", "nodes": [], "edges": [], "message": "Соседние вершины не найдены."
+    }
+
+
+@pytest.mark.parametrize("filters", [
+    {"direction": "bad"}, {"direction": []}, {"relation": []},
+    {"relation": "UNKNOWN"}, {"relation": ""}, {"extra": "x"},
+])
+def test_neighbors_invalid_filters(demo, filters):
+    assert demo.neighbors("sensor:t101", **filters)["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("filters", [
+    {"valid_at": "2026-11-10T10:00:00+05:00"}, {"relation": "BEFORE"},
+    {"relation": "CAUSES"},
+])
+def test_neighbors_deferred_filters(demo, filters):
+    assert demo.neighbors("sensor:t101", **filters)["error_code"] == "unsupported_operation"
+
+
+@pytest.mark.parametrize("subject_id", [None, [], "", 123])
+def test_neighbors_invalid_subject(demo, subject_id):
+    assert demo.neighbors(subject_id)["error_code"] == "invalid_data"
+
+
+def test_measurement_quantity_must_match_sensor(demo):
+    demo.create_node({"id": "sensor:p101", "type": "Sensor", "label": "Датчик давления",
+                      "properties": {"quantity": "pressure"}})
+    result = demo.create_edge({"id": "edge:mismatch", "source": "sensor:p101",
+                               "target": "measurement:t001", "relation": "PRODUCED_MEASUREMENT"})
+    assert result["error_code"] == "invalid_data"
+    assert demo.neighbors("sensor:p101")["status"] == "no_data"
+
+
+def test_sensor_without_quantity_can_produce_measurement(demo):
+    demo.create_node({"id": "sensor:unknown", "type": "Sensor", "label": "Датчик"})
+    result = demo.create_edge({"id": "edge:reading", "source": "sensor:unknown",
+                               "target": "measurement:t001", "relation": "PRODUCED_MEASUREMENT"})
+    assert result["effect"] == "created"
+
+
+@pytest.mark.parametrize("result_source", ["created", "existing", "neighbors"])
+def test_edge_results_are_independent(demo, edge, result_source):
+    edge["properties"] = {"details": {"tags": ["original"]}}
+    original = deepcopy(edge)
+    created = demo.create_edge(edge)
+    if result_source == "created":
+        result = created
+    elif result_source == "existing":
+        result = demo.create_edge(edge)
+    else:
+        result = demo.neighbors("sensor:t101")
+        result["nodes"][0]["label"] = "Изменено"
+    result["edges"][0]["properties"]["details"]["tags"].append("changed")
+    edge["properties"]["details"]["tags"].append("input changed")
+    found = demo.neighbors("sensor:t101")
+    assert found["edges"] == [original]
+    assert found["nodes"][0]["label"] == "Двигатель М-101"
+
+
+@pytest.mark.parametrize("value", [{1}, float("nan"), float("inf"), float("-inf")])
+def test_edge_rejects_non_json_values(demo, edge, value):
+    edge["properties"] = {"nested": [value]}
+    result = demo.create_edge(edge)
+    assert result["status"] == "error"
+    assert result["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("edge_record", [None, [], {}])
+def test_edge_requires_dictionary(demo, edge_record):
+    assert demo.create_edge(edge_record)["error_code"] == "invalid_data"
+
+
+@pytest.mark.parametrize("properties", [
+    {"quantity": "temperature"}, {"quantity": "pressure"}, {},
+])
+def test_measurement_rejects_second_sensor(demo, properties):
+    original = {"id": "edge:reading", "source": "sensor:t101",
+                "target": "measurement:t001", "relation": "PRODUCED_MEASUREMENT"}
+    assert demo.create_edge(original)["effect"] == "created"
+    demo.create_node({"id": "sensor:t102", "type": "Sensor", "label": "Другой датчик",
+                      "properties": properties})
+    attempted = {**original, "id": "edge:other", "source": "sensor:t102"}
+    result = demo.create_edge(attempted)
+    assert result["status"] == "error"
+    assert result["error_code"] == "conflict"
+    assert demo.neighbors("measurement:t001", direction="incoming")["edges"] == [original]
+    assert demo.neighbors("sensor:t102")["status"] == "no_data"
+    # Неудачная попытка не занимает ID новой связи.
+    assert demo.create_edge({**original, "id": "edge:other"})["effect"] == "created"
+
+
+@pytest.mark.parametrize("first_target, second_target", [
+    ("component:m101", "equipment:n101"),
+    ("equipment:n101", "component:m101"),
+])
+def test_measurement_rejects_second_object(demo, first_target, second_target):
+    original = {"id": "edge:object", "source": "measurement:t001",
+                "target": first_target, "relation": "MEASURES"}
+    assert demo.create_edge(original)["effect"] == "created"
+    result = demo.create_edge({**original, "id": "edge:other", "target": second_target})
+    assert result["status"] == "error"
+    assert result["error_code"] == "conflict"
+    assert demo.neighbors("measurement:t001")["edges"] == [original]
+    assert demo.create_edge({**original, "id": "edge:other"})["effect"] == "created"
+
+
+@pytest.mark.parametrize("relation, source, target, direction", [
+    ("PRODUCED_MEASUREMENT", "sensor:t101", "measurement:t001", "incoming"),
+    ("MEASURES", "measurement:t001", "component:m101", "outgoing"),
+])
+def test_measurement_allows_repeated_fact_and_parallel_edges(demo, relation, source, target, direction):
+    first = {"id": "edge:fact-1", "source": source, "target": target, "relation": relation}
+    second = {**first, "id": "edge:fact-2"}
+    for record in (first, second):
+        assert demo.create_edge(record)["effect"] == "created"
+        repeated = demo.create_edge(record)
+        assert repeated["status"] == "ok"
+        assert repeated["effect"] == "already_exists"
+    result = demo.neighbors("measurement:t001", relation=relation, direction=direction)
+    assert result["edges"] == [first, second]
+    assert len(result["nodes"]) == 1
+
+
+def test_measurement_can_have_sensor_and_object_independently(demo):
+    sensor_edge = {"id": "edge:sensor", "source": "sensor:t101",
+                   "target": "measurement:t001", "relation": "PRODUCED_MEASUREMENT"}
+    object_edge = {"id": "edge:object", "source": "measurement:t001",
+                   "target": "component:m101", "relation": "MEASURES"}
+    assert demo.create_edge(sensor_edge)["effect"] == "created"
+    assert demo.create_edge(object_edge)["effect"] == "created"
+    assert len(demo.neighbors("measurement:t001", direction="both")["edges"]) == 2
+
+
+def test_measurement_without_edges_is_allowed(core):
+    result = core.create_node({
+        "id": "measurement:standalone", "type": "Measurement", "label": "Температура",
+        "properties": {"quantity": "temperature", "value": 95, "unit": "°C",
+                       "observed_at": "2026-11-10T10:00:00+05:00"},
+    })
+    assert result["effect"] == "created"
+    assert core.neighbors("measurement:standalone", direction="both")["status"] == "no_data"
+
+
+def test_empty_neighbors_message_does_not_change_find_nodes_message(demo, edge):
+    demo.create_edge(edge)
+    result = demo.neighbors("sensor:t101", relation="HAS_EVENT")
+    assert result["status"] == "no_data"
+    assert result["message"] == "Соседние вершины не найдены."
+    assert demo.find_nodes(id="missing")["message"] == "Вершины не найдены."

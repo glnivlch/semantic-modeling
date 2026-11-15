@@ -1,6 +1,6 @@
 """Минимальное ядро в памяти по договору данных версии 0.3.
 
-SQLite и операции со связями будут добавлены на следующих этапах.
+SQLite будет добавлена на следующем этапе.
 """
 
 from copy import deepcopy
@@ -11,13 +11,27 @@ import networkx as nx
 
 
 NODE_TYPES = {"Equipment", "Component", "Sensor", "Measurement", "Event"}
+EDGE_TYPES = {
+    "HAS_COMPONENT": {("Equipment", "Component")},
+    "INSTALLED_ON": {("Sensor", "Equipment"), ("Sensor", "Component")},
+    "MONITORS": {("Sensor", "Equipment"), ("Sensor", "Component")},
+    "PRODUCED_MEASUREMENT": {("Sensor", "Measurement")},
+    "MEASURES": {("Measurement", "Equipment"), ("Measurement", "Component")},
+    "HAS_EVENT": {("Equipment", "Event"), ("Component", "Event")},
+}
+DEFERRED_RELATIONS = {"CAUSES", "NOT_CAUSES"}
+COMPUTED_RELATIONS = {"BEFORE", "AFTER", "AFTER_NOT_CAUSED_BY"}
+DEFERRED_EDGE_FIELDS = {"time_scope", "valid_from", "valid_to", "base_weight", "decay_policy"}
 
 
 class GraphCore:
-    """Создаёт и ищет вершины, сохраняя внутренний граф закрытым."""
+    """Управляет вершинами и связями, сохраняя внутренний граф закрытым."""
 
     def __init__(self):
         self._graph = nx.MultiDiGraph()
+        # Ключ ребра в NetworkX уникален только внутри пары вершин.
+        # Этот индекс обеспечивает уникальность ID во всём графе.
+        self._edge_locations = {}
 
     def create_node(self, node: dict) -> dict:
         """Проверить запись и добавить её либо вернуть результат повтора."""
@@ -43,6 +57,8 @@ class GraphCore:
             return self._error("invalid_data", message)
 
         node_id = record["id"]
+        if node_id in self._edge_locations:
+            return self._error("conflict", "ID уже занят связью.")
         if node_id in self._graph:
             existing = self._graph.nodes[node_id]
             if existing != record:
@@ -76,6 +92,110 @@ class GraphCore:
             found.append(record)
 
         return self._result(found)
+
+    def create_edge(self, edge: dict) -> dict:
+        """Создать сохраняемую связь, используя её ID как ключ ребра."""
+        if not isinstance(edge, dict):
+            return self._error("invalid_data", "Связь должна быть словарём.")
+        try:
+            compatible = self._is_json_compatible(edge)
+        except RecursionError:
+            compatible = False
+        if not compatible:
+            return self._error("invalid_data", "Связь должна быть JSON-совместимой.")
+        for field in ("id", "source", "target", "relation"):
+            if not isinstance(edge.get(field), str) or not edge[field]:
+                return self._error("invalid_data", f"Поле {field} должно быть непустой строкой.")
+        if DEFERRED_EDGE_FIELDS.intersection(edge) or edge["relation"] in DEFERRED_RELATIONS:
+            return self._error("unsupported_operation", "Временные, причинные отношения и старение пока не поддерживаются.")
+        if edge["relation"] not in EDGE_TYPES:
+            return self._error("invalid_data", "Неизвестное сохраняемое отношение.")
+        if "properties" in edge and not isinstance(edge["properties"], dict):
+            return self._error("invalid_data", "Поле properties должно быть словарём.")
+
+        record = deepcopy(edge)
+        try:
+            if "created_at" in record:
+                record["created_at"] = self._utc_time(record["created_at"])
+        except (ValueError, TypeError):
+            return self._error("invalid_data", "Дата должна быть строкой ISO 8601 с часовым поясом.")
+
+        edge_id = record["id"]
+        if edge_id in self._graph:
+            return self._error("conflict", "ID уже занят вершиной.")
+        if edge_id in self._edge_locations:
+            source, target = self._edge_locations[edge_id]
+            existing = self._graph.edges[source, target, edge_id]
+            if existing != record:
+                return self._error("conflict", "ID уже занят другими данными связи.")
+            return self._result([], [existing], effect="already_exists")
+
+        source, target = record["source"], record["target"]
+        if source not in self._graph or target not in self._graph:
+            return self._error("not_found", "Начальная или конечная вершина отсутствует.")
+        source_node = self._graph.nodes[source]
+        target_node = self._graph.nodes[target]
+        relation = record["relation"]
+        if (source_node["type"], target_node["type"]) not in EDGE_TYPES[relation]:
+            return self._error("invalid_data", "Отношение не допускает выбранную пару типов вершин.")
+        if relation == "PRODUCED_MEASUREMENT":
+            # Сравниваем датчики, а не количество рёбер: параллельные факты допустимы.
+            for sensor_id, _, existing in self._graph.in_edges(target, data=True):
+                if existing["relation"] == relation and sensor_id != source:
+                    return self._error("conflict", "Измерение уже связано с другим датчиком.")
+            quantity = source_node["properties"].get("quantity")
+            if "quantity" in source_node["properties"] and quantity != target_node["properties"]["quantity"]:
+                return self._error("invalid_data", "Величина измерения не соответствует датчику.")
+        if relation == "MEASURES":
+            for _, object_id, existing in self._graph.out_edges(source, data=True):
+                if existing["relation"] == relation and object_id != target:
+                    return self._error("conflict", "Измерение уже связано с другим объектом.")
+
+        self._graph.add_edge(source, target, key=edge_id)
+        self._graph.edges[source, target, edge_id].update(record)
+        self._edge_locations[edge_id] = (source, target)
+        return self._result([], [record], effect="created")
+
+    def neighbors(self, subject_id, relation=None, direction="outgoing", **filters) -> dict:
+        """Вернуть соседей одного шага и все подходящие параллельные связи."""
+        deferred_filters = {"valid_at", "event_time_from", "event_time_to",
+                            "window_from", "window_to", "evaluation_time"}
+        if filters.keys() - deferred_filters:
+            return self._error("invalid_data", "Передан неподдерживаемый фильтр.")
+        if filters:
+            return self._error("unsupported_operation", "Расширенные условия пока не поддерживаются.")
+        if not isinstance(subject_id, str) or not subject_id:
+            return self._error("invalid_data", "subject_id должен быть непустой строкой.")
+        if direction not in ("outgoing", "incoming", "both"):
+            return self._error("invalid_data", "Некорректное направление поиска.")
+        if relation is not None:
+            if not isinstance(relation, str):
+                return self._error("invalid_data", "Отношение должно быть строкой.")
+            if relation in DEFERRED_RELATIONS or relation in COMPUTED_RELATIONS:
+                return self._error("unsupported_operation", "Запрошенное отношение пока не поддерживается.")
+            if relation not in EDGE_TYPES:
+                return self._error("invalid_data", "Неизвестное сохраняемое отношение.")
+        if subject_id not in self._graph:
+            return self._error("not_found", "Исходная вершина отсутствует.")
+
+        candidates = []
+        if direction in ("outgoing", "both"):
+            candidates.extend(self._graph.out_edges(subject_id, keys=True, data=True))
+        if direction in ("incoming", "both"):
+            candidates.extend(self._graph.in_edges(subject_id, keys=True, data=True))
+        found_edges = {}
+        neighbor_ids = set()
+        for source, target, edge_id, record in candidates:
+            if relation is not None and record["relation"] != relation:
+                continue
+            found_edges[edge_id] = record
+            neighbor_ids.add(target if source == subject_id else source)
+        nodes = [self._graph.nodes[node_id] for node_id in sorted(neighbor_ids)]
+        edges = [found_edges[edge_id] for edge_id in sorted(found_edges)]
+        result = self._result(nodes, edges)
+        if result["status"] == "no_data":
+            result["message"] = "Соседние вершины не найдены."
+        return result
 
     @staticmethod
     def _is_json_compatible(value) -> bool:
@@ -157,13 +277,13 @@ class GraphCore:
         return parsed.astimezone(timezone.utc).isoformat()
 
     @staticmethod
-    def _result(nodes: list, **extra) -> dict:
+    def _result(nodes: list, edges: list | None = None, **extra) -> dict:
         result = {
-            "status": "ok" if nodes else "no_data",
+            "status": "ok" if nodes or edges else "no_data",
             "nodes": deepcopy(nodes),
-            "edges": [],
+            "edges": deepcopy(edges) if edges else [],
         }
-        if not nodes:
+        if not nodes and not edges:
             result["message"] = "Вершины не найдены."
         result.update(extra)
         return result
